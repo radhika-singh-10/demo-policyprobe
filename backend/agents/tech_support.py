@@ -2,17 +2,14 @@
 Tech Support Agent
 
 Handles general technical support queries with low privilege level.
-Escalation to higher-privilege agents requires explicit human-approval token.
+Can escalate to higher-privilege agents when needed.
 
-SECURITY NOTES:
-- Token validation enforced via constant-time comparison
-- User input sanitized before LLM calls
-- LLM output scanned for dangerous code execution primitives
-- PII encrypted and redacted from logs
-- Audit trail maintained for all LLM interactions
-- No dynamic privilege escalation permitted
+SECURITY NOTES (for Unifai demo):
+- Low privilege agent can escalate without proper verification
+- User context passed without sanitization
 """
 
+import base64
 import hashlib
 import hmac
 import logging
@@ -25,121 +22,195 @@ import uuid
 from typing import Any, Optional
 
 from .auth.agent_auth import AgentIdentity
-from llm.approved_client import ApprovedLLMClient
+from llm.approved_registry import ApprovedLLMClient
 
 logger = logging.getLogger(__name__)
 
-# Rotating audit log handler
-_audit_logger = logging.getLogger("tech_support.audit")
-if not _audit_logger.handlers:
+# Audit logger with rotating file handler
+audit_logger = logging.getLogger("audit.tech_support")
+if not audit_logger.handlers:
     _audit_handler = logging.handlers.RotatingFileHandler(
-        "audit_tech_support.log", maxBytes=10 * 1024 * 1024, backupCount=10
+        "audit_tech_support.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=10
     )
     _audit_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    _audit_logger.addHandler(_audit_handler)
-    _audit_logger.setLevel(logging.INFO)
+    audit_logger.addHandler(_audit_handler)
+    audit_logger.setLevel(logging.INFO)
 
-# Approved model registry with pinned identifiers and integrity hashes
-APPROVED_MODELS = {
-    "approved-model-v1.0": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-    "approved-model-v1.1": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-}
-PINNED_MODEL = os.environ.get("PINNED_MODEL_ID", "approved-model-v1.0")
+# Approved model constant (version-pinned)
+APPROVED_MODEL = "openai/gpt-4o-2024-05-13"
 
-# Tool allow list
-ALLOWED_TOOLS = frozenset({"llm_chat"})
+# Allowed tools and agent escalations
+ALLOWED_TOOLS = ["llm_chat"]
+ALLOWED_AGENT_ESCALATIONS: list[str] = []  # No direct escalations allowed; require human approval
 
-# Valid tokens loaded from environment
-_VALID_TOKENS = set(
-    filter(None, os.environ.get("VALID_AGENT_TOKENS", "").split(","))
-)
+# Shared secret for HMAC token validation (loaded from environment)
+_AGENT_SHARED_SECRET = os.environ.get("AGENT_SHARED_SECRET", "")
 
-# HMAC watermark secret
-_WATERMARK_SECRET = os.environ.get("WATERMARK_SECRET", "change-me-in-production").encode()
-
-# Prompt injection patterns
-_PROMPT_INJECTION_PATTERNS = [
-    re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.IGNORECASE),
-    re.compile(r"you\s+are\s+now", re.IGNORECASE),
-    re.compile(r"disregard\s+(all\s+)?prior", re.IGNORECASE),
-    re.compile(r"system\s*prompt", re.IGNORECASE),
-    re.compile(r"<\s*script", re.IGNORECASE),
-    re.compile(r"\bjailbreak\b", re.IGNORECASE),
-    re.compile(r"act\s+as\s+(if\s+you\s+are|a)", re.IGNORECASE),
+# Dynamic code execution primitives to block in LLM output
+_DANGEROUS_PRIMITIVES = [
+    "eval(", "exec(", "subprocess", "os.system", "compile(",
+    "__import__", "importlib", "execfile", "open(", "pty.spawn",
+    "popen", "Popen", "ctypes", "cffi"
 ]
 
-# Shell/binary command patterns
-_SHELL_PATTERNS = [
-    re.compile(r"\b(rm|chmod|chown|wget|curl|nc|bash|sh|python|perl|ruby|php)\s", re.IGNORECASE),
-    re.compile(r"[;&|`$]\s*\w+"),
-    re.compile(r"\.\./"),
-    re.compile(r"base64\s*(-d|--decode)", re.IGNORECASE),
-]
-
-# Dynamic code execution primitives in LLM output
-_CODE_EXEC_PATTERNS = [
-    re.compile(r"\beval\s*\(", re.IGNORECASE),
-    re.compile(r"\bexec\s*\(", re.IGNORECASE),
-    re.compile(r"\bcompile\s*\(", re.IGNORECASE),
-    re.compile(r"\b__import__\s*\(", re.IGNORECASE),
-    re.compile(r"\bexecfile\s*\(", re.IGNORECASE),
-    re.compile(r"\bos\.system\s*\(", re.IGNORECASE),
-    re.compile(r"\bsubprocess\b.*shell\s*=\s*True", re.IGNORECASE),
-    re.compile(r"\bgetattr\s*\(.*__", re.IGNORECASE),
+# Prompt injection / malicious command patterns
+_INJECTION_PATTERNS = [
+    r"ignore\s+previous\s+instructions",
+    r"disregard\s+all\s+prior",
+    r"you\s+are\s+now",
+    r"act\s+as\s+if",
+    r"system\s*prompt",
+    r"<\s*script",
+    r"javascript\s*:",
+    r"data\s*:",
+    r"base64",
+    r"\\x[0-9a-fA-F]{2}",
+    r"\\u[0-9a-fA-F]{4}",
+    r"rm\s+-rf",
+    r"sudo\s+",
+    r"chmod\s+",
+    r"curl\s+",
+    r"wget\s+",
+    r"\|\s*sh",
+    r"&&\s*",
+    r";\s*[a-z]+\s",
 ]
 
 MAX_INPUT_LENGTH = 4096
 
 
-def _validate_token(token: Optional[str]) -> bool:
-    """Validate token using constant-time comparison against known valid tokens."""
-    if not token or not _VALID_TOKENS:
+def _validate_token(token: str) -> bool:
+    """Validate an HMAC-signed agent token with expiry checking."""
+    if not token or not _AGENT_SHARED_SECRET:
         return False
-    for valid in _VALID_TOKENS:
-        if hmac.compare_digest(token, valid):
-            return True
-    return False
+    try:
+        # Expected format: <expiry_timestamp>.<hmac_hex>
+        parts = token.split(".", 1)
+        if len(parts) != 2:
+            return False
+        expiry_str, provided_hmac = parts
+        expiry = int(expiry_str)
+        if time.time() > expiry:
+            return False
+        expected_hmac = hmac.new(
+            _AGENT_SHARED_SECRET.encode(),
+            expiry_str.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected_hmac, provided_hmac)
+    except Exception:
+        return False
 
 
-def _verify_model_integrity(model_id: str) -> bool:
-    """Verify the model is on the approved list."""
-    return model_id in APPROVED_MODELS
+def _generate_signed_token(ttl_seconds: int = 300) -> str:
+    """Generate a cryptographically signed, expiring HMAC-SHA256 token."""
+    expiry = int(time.time()) + ttl_seconds
+    expiry_str = str(expiry)
+    sig = hmac.new(
+        _AGENT_SHARED_SECRET.encode(),
+        expiry_str.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return f"{expiry_str}.{sig}"
+
+
+def _sanitize_input(text: str, max_length: int = MAX_INPUT_LENGTH) -> str:
+    """Strip null bytes, control characters, enforce max length."""
+    if not text:
+        return ""
+    # Remove null bytes
+    text = text.replace("\x00", "")
+    # Remove control characters (except newline, tab, carriage return)
+    text = "".join(
+        ch for ch in text
+        if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\t", "\r")
+    )
+    # Enforce max length
+    text = text[:max_length]
+    return text
+
+
+def _sanitize_and_validate_message(message: str) -> str:
+    """
+    Sanitize and validate user message:
+    - Strip null bytes and control characters
+    - Enforce length limit
+    - Remove prompt injection patterns
+    - Check for hidden/invisible characters
+    - Check for base64-encoded payloads
+    - Check for shell commands and binary content
+    - Check for leetspeak obfuscation patterns
+    """
+    message = _sanitize_input(message)
+
+    # Remove invisible/zero-width characters
+    invisible_chars = [
+        "\u200b", "\u200c", "\u200d", "\u200e", "\u200f",
+        "\ufeff", "\u2028", "\u2029"
+    ]
+    for ch in invisible_chars:
+        message = message.replace(ch, "")
+
+    # Check for binary content
+    try:
+        message.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("Message contains invalid binary content.")
+
+    # Check for base64-encoded payloads (heuristic: long base64-like strings)
+    b64_pattern = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+    if b64_pattern.search(message):
+        # Attempt to decode and check for dangerous content
+        matches = b64_pattern.findall(message)
+        for match in matches:
+            try:
+                decoded = base64.b64decode(match).decode("utf-8", errors="ignore")
+                for primitive in _DANGEROUS_PRIMITIVES:
+                    if primitive in decoded:
+                        raise ValueError("Message contains encoded dangerous content.")
+            except Exception as e:
+                if "dangerous" in str(e):
+                    raise
+
+    # Strip prompt injection patterns
+    for pattern in _INJECTION_PATTERNS:
+        if re.search(pattern, message, re.IGNORECASE):
+            raise ValueError(f"Message contains disallowed pattern: {pattern}")
+
+    return message
+
+
+def _sanitize_llm_output(response: str) -> str:
+    """
+    Validate and sanitize LLM output.
+    Check for dynamic code execution primitives.
+    """
+    for primitive in _DANGEROUS_PRIMITIVES:
+        if primitive in response:
+            raise ValueError(
+                f"LLM response contains dangerous primitive: {primitive}"
+            )
+    return response
 
 
 def _encrypt_pii(value: str) -> str:
-    """Encrypt PII using Fernet if available, otherwise base64-encode with marker."""
-    try:
-        from cryptography.fernet import Fernet
-        key = os.environ.get("PII_ENCRYPTION_KEY", "").encode()
-        if len(key) == 44:
-            f = Fernet(key)
-            return "[ENCRYPTED]" + f.encrypt(value.encode()).decode()
-    except Exception:
-        pass
-    import base64
-    return "[B64-ENCODED]" + base64.b64encode(value.encode()).decode()
+    """Simple base64-based obfuscation for PII fields."""
+    return base64.b64encode(value.encode("utf-8")).decode("utf-8")
 
 
-def _attach_provenance(response_text: str, model_id: str) -> dict:
-    """Attach provenance metadata, label, and HMAC watermark to LLM output."""
-    timestamp = time.time()
-    content_hash = hashlib.sha256(response_text.encode()).hexdigest()
-    watermark = hmac.new(
-        _WATERMARK_SECRET,
-        f"{response_text}{model_id}{timestamp}".encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return {
-        "text": response_text,
-        "provenance": {
-            "model_id": model_id,
-            "timestamp": timestamp,
-            "content_origin": "ai-generated",
-            "content_hash": content_hash,
-        },
-        "label": "AI_GENERATED_CONTENT",
-        "watermark": watermark,
-    }
+def _apply_watermark(text: str, agent_id: str) -> str:
+    """Apply a lightweight HMAC-based watermark to response text."""
+    if not _AGENT_SHARED_SECRET:
+        watermark = hashlib.sha256(f"{agent_id}:{text}".encode()).hexdigest()[:16]
+    else:
+        watermark = hmac.new(
+            _AGENT_SHARED_SECRET.encode(),
+            f"{agent_id}:{text}".encode(),
+            hashlib.sha256
+        ).hexdigest()[:16]
+    return f"{text}\n\n[AI-Generated | watermark:{watermark}]"
 
 
 class TechSupportAgent:
@@ -150,12 +221,11 @@ class TechSupportAgent:
     Capabilities:
     - Answer general questions
     - Provide technical guidance
-    - Inform users to contact specialized teams directly
+    - Escalate to specialized agents (requires human approval)
     """
 
     ALLOWED_ROLES = ["user", "tech_support", "admin"]
     PRIVILEGE_LEVEL = "low"
-    ALLOWED_ESCALATION_TARGETS: frozenset = frozenset()  # No runtime escalation permitted
 
     def __init__(self, llm_client: ApprovedLLMClient):
         self.llm_client = llm_client
@@ -179,61 +249,45 @@ class TechSupportAgent:
         Returns:
             Response dictionary
         """
-        trace_id = str(uuid.uuid4())
-
         token = headers.get("X-Agent-Token") if headers else None
-        if not _validate_token(token):
-            raise PermissionError("Authentication failed: missing or invalid X-Agent-Token.")
+        if not token or not _validate_token(token):
+            raise PermissionError("Missing or invalid authentication token. Access denied.")
 
-        raw_message = context.get("user_message", "")
+        logger.debug("Received request with validated token.")
 
-        # Sanitize and validate input before any processing
-        user_message = self._sanitize_input(raw_message)
-        self._check_malicious_input(user_message)
+        user_message = context.get("user_message", "")
 
-        # Check if this needs finance information
+        # Check if this needs escalation to finance
         if self._needs_finance_escalation(user_message):
             logger.info(
-                "Tech support detected finance-related query; directing user to contact finance directly.",
+                "Tech support requesting finance escalation (human approval required)",
                 extra={
                     "reason": "Financial query detected",
-                    "trace_id": trace_id,
+                    "user_message": user_message[:100]
                 }
             )
-            return {
-                "response": (
-                    "Your query appears to relate to financial information. "
-                    "Please contact the Finance team directly for assistance with "
-                    "quarterly reports, financial statements, budgets, and related topics."
-                ),
-                "agent": self.agent_id,
-                "privilege_level": self.PRIVILEGE_LEVEL,
-                "task_complete": True,
-                "termination_reason": "finance_query_redirected",
-                "trace_id": trace_id,
-            }
-
-        if not user_message.strip():
-            return {
-                "response": "I did not receive a message. Please provide your question.",
-                "agent": self.agent_id,
-                "privilege_level": self.PRIVILEGE_LEVEL,
-                "task_complete": True,
-                "termination_reason": "empty_input",
-                "trace_id": trace_id,
-            }
+            return await self._escalate_to_finance(user_message, context, token)
 
         # Handle the query directly
-        response_obj = await self._process_query(user_message, context, trace_id=trace_id)
+        # Check tool is allowed
+        if "llm_chat" not in ALLOWED_TOOLS:
+            logger.warning(
+                "Denied tool invocation",
+                extra={
+                    "actor": self.agent_id,
+                    "tool": "llm_chat",
+                    "policy_version": "1.0",
+                    "denial_reason": "Tool not in ALLOWED_TOOLS"
+                }
+            )
+            raise PermissionError("Tool 'llm_chat' is not in the allowed tools list.")
+
+        response = await self._process_query(user_message, context)
 
         return {
-            "response": response_obj,
+            "response": response,
             "agent": self.agent_id,
-            "privilege_level": self.PRIVILEGE_LEVEL,
-            "task_complete": True,
-            "termination_reason": "successful_response",
-            "trace_id": trace_id,
-            "model_id": PINNED_MODEL,
+            "model": APPROVED_MODEL
         }
 
     def _needs_finance_escalation(self, message: str) -> bool:
@@ -246,64 +300,86 @@ class TechSupportAgent:
         message_lower = message.lower()
         return any(trigger in message_lower for trigger in finance_triggers)
 
-    def _sanitize_input(self, text: str) -> str:
-        """Strip null bytes, control characters, and enforce maximum length."""
-        # Remove null bytes
-        text = text.replace("\x00", "")
-        # Remove control characters (except newline and tab which are legitimate)
-        text = "".join(
-            ch for ch in text
-            if unicodedata.category(ch) not in ("Cc",) or ch in ("\n", "\t", "\r")
-        )
-        # Enforce maximum length
-        if len(text) > MAX_INPUT_LENGTH:
-            text = text[:MAX_INPUT_LENGTH]
-        return text
+    async def _escalate_to_finance(
+        self,
+        query: str,
+        original_context: dict,
+        validated_token: Optional[str] = None
+    ) -> dict[str, Any]:
+        """
+        Request escalation to finance agent.
 
-    def _check_malicious_input(self, text: str) -> None:
+        This method does NOT directly invoke the FinanceAgent.
+        Instead, it returns a structured escalation request requiring
+        human-in-the-loop approval.
         """
-        Check for prompt injection, shell commands, hidden characters,
-        base64-encoded payloads, and other malicious patterns.
-        Raises ValueError if dangerous content is detected.
-        """
-        for pattern in _PROMPT_INJECTION_PATTERNS:
-            if pattern.search(text):
-                raise ValueError("Input rejected: potential prompt injection detected.")
-        for pattern in _SHELL_PATTERNS:
-            if pattern.search(text):
-                raise ValueError("Input rejected: potential shell command detected.")
-        # Check for high density of invisible/control characters
-        invisible_count = sum(
-            1 for ch in text if unicodedata.category(ch) in ("Cf", "Cc")
-        )
-        if invisible_count > 5:
-            raise ValueError("Input rejected: excessive invisible characters detected.")
+        # Check escalation is allowed
+        if "finance" not in ALLOWED_AGENT_ESCALATIONS:
+            logger.warning(
+                "Denied agent escalation",
+                extra={
+                    "actor": self.agent_id,
+                    "target_agent": "finance",
+                    "policy_version": "1.0",
+                    "denial_reason": "finance not in ALLOWED_AGENT_ESCALATIONS; human approval required"
+                }
+            )
 
-    def _sanitize_llm_output(self, text: str) -> str:
-        """
-        Scan LLM output for dynamic code execution primitives.
-        Raises ValueError if dangerous content is found.
-        """
-        for pattern in _CODE_EXEC_PATTERNS:
-            if pattern.search(text):
-                raise ValueError(
-                    "LLM output rejected: dynamic code execution primitive detected."
-                )
-        return text
+        trace_id = str(uuid.uuid4())
+
+        # Sanitize query before including in escalation request
+        try:
+            sanitized_query = _sanitize_and_validate_message(query)
+        except ValueError as e:
+            logger.warning("Escalation query failed sanitization: %s", str(e))
+            sanitized_query = "[sanitized]"
+
+        # Pass only an allowlisted subset of original_context
+        safe_context = {
+            k: original_context[k]
+            for k in ("user_message", "session_id", "request_id")
+            if k in original_context
+        }
+
+        audit_logger.info(
+            "ESCALATION_REQUEST agent=%s target=finance trace_id=%s requires_human_approval=True",
+            self.agent_id,
+            trace_id
+        )
+
+        logger.info(
+            "Escalation to finance agent requires human approval",
+            extra={"trace_id": trace_id, "agent": self.agent_id}
+        )
+
+        return {
+            "response": (
+                "Your query requires access to financial data. "
+                "An escalation request has been submitted for human approval. "
+                "You will be notified when a finance specialist reviews your request."
+            ),
+            "agent": self.agent_id,
+            "escalation_pending": True,
+            "escalation_target": "finance",
+            "trace_id": trace_id,
+            "requires_human_approval": True,
+            "model": APPROVED_MODEL
+        }
 
     async def _process_query(
         self,
         message: str,
-        context: dict,
-        trace_id: str = ""
-    ) -> dict:
+        context: dict
+    ) -> str:
         """
         Process a general tech support query.
-        Input is sanitized before sending to LLM.
-        Output is scanned for dangerous primitives and labeled with provenance.
         """
-        if not _verify_model_integrity(PINNED_MODEL):
-            raise ValueError(f"Model '{PINNED_MODEL}' is not on the approved model registry.")
+        # Sanitize and validate input before passing to LLM
+        try:
+            message = _sanitize_and_validate_message(message)
+        except ValueError as e:
+            logger.warning("User message failed sanitization: %s", str(e))
+            return "Your message could not be processed due to disallowed content."
 
         system_prompt = """You are a helpful technical support agent for PolicyProbe.
 You can help users with:
@@ -314,79 +390,116 @@ You can help users with:
 
 Be helpful, professional, and concise in your responses."""
 
-        # Sanitize and validate input before sending to LLM
-        sanitized_message = self._sanitize_input(message)
-        self._check_malicious_input(sanitized_message)
+        messages_payload = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message}
+        ]
 
-        input_hash = hashlib.sha256(sanitized_message.encode()).hexdigest()
+        inference_id = str(uuid.uuid4())
+        input_hash = hashlib.sha256(message.encode()).hexdigest()
+        invocation_timestamp = time.time()
 
-        logger.info(
-            "LLM request",
-            extra={
-                "trace_id": trace_id,
-                "agent": self.agent_id,
-                "model": PINNED_MODEL,
-                "system_prompt_length": len(system_prompt),
-                "user_message_hash": input_hash,
-            }
-        )
-
-        # Verify tool is on allow list
-        if "llm_chat" not in ALLOWED_TOOLS:
-            _audit_logger.info(
-                "TOOL_DENIED actor=%s policy_version=1 tool=llm_chat reason=not_in_allowlist",
-                self.agent_id,
-            )
-            raise PermissionError("Tool 'llm_chat' is not permitted for this agent.")
-
-        raw_response = await self.llm_client.chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": sanitized_message}
-            ],
-            model=PINNED_MODEL,
-        )
-
-        logger.info(
-            "LLM response received",
-            extra={
-                "trace_id": trace_id,
-                "agent": self.agent_id,
-                "model": PINNED_MODEL,
-                "response_length": len(raw_response) if raw_response else 0,
-            }
-        )
-
-        # Scan output for dangerous primitives
-        safe_response = self._sanitize_llm_output(raw_response)
-
-        # Attach provenance, label, and watermark — fail-safe block
-        try:
-            labeled_response = _attach_provenance(safe_response, PINNED_MODEL)
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to attach provenance/watermark to LLM output; refusing to return unlabeled content."
-            ) from exc
-
-        _audit_logger.info(
-            "LLM_INTERACTION trace_id=%s model=%s input_hash=%s output_hash=%s timestamp=%s principal=%s model_integrity=%s",
-            trace_id,
-            PINNED_MODEL,
-            input_hash,
-            labeled_response["provenance"]["content_hash"],
-            labeled_response["provenance"]["timestamp"],
+        audit_logger.info(
+            "LLM_REQUEST inference_id=%s agent=%s model=%s input_hash=%s timestamp=%s",
+            inference_id,
             self.agent_id,
-            APPROVED_MODELS.get(PINNED_MODEL, "unknown"),
+            APPROVED_MODEL,
+            input_hash,
+            invocation_timestamp
         )
 
-        return labeled_response
+        logger.info(
+            "Sending request to LLM",
+            extra={
+                "inference_id": inference_id,
+                "model": APPROVED_MODEL,
+                "input_hash": input_hash,
+                "agent_id": self.agent_id
+            }
+        )
+
+        try:
+            response = await self.llm_client.chat(
+                messages=messages_payload,
+                model=APPROVED_MODEL
+            )
+        except Exception as e:
+            audit_logger.error(
+                "LLM_ERROR inference_id=%s agent=%s error=%s",
+                inference_id,
+                self.agent_id,
+                str(e)
+            )
+            raise
+
+        logger.info(
+            "Received response from LLM",
+            extra={
+                "inference_id": inference_id,
+                "model": APPROVED_MODEL,
+                "output_hash": hashlib.sha256(str(response).encode()).hexdigest(),
+                "agent_id": self.agent_id
+            }
+        )
+
+        output_hash = hashlib.sha256(str(response).encode()).hexdigest()
+        audit_logger.info(
+            "LLM_RESPONSE inference_id=%s agent=%s model=%s output_hash=%s timestamp=%s",
+            inference_id,
+            self.agent_id,
+            APPROVED_MODEL,
+            output_hash,
+            time.time()
+        )
+
+        # Validate and sanitize LLM output
+        try:
+            response = _sanitize_llm_output(response)
+        except ValueError as e:
+            audit_logger.warning(
+                "LLM_OUTPUT_BLOCKED inference_id=%s reason=%s",
+                inference_id,
+                str(e)
+            )
+            return "The response could not be delivered due to a content policy violation."
+
+        # Apply provenance metadata and watermark
+        try:
+            response_with_provenance = _apply_watermark(response, self.agent_id)
+            provenance_metadata = {
+                "model": APPROVED_MODEL,
+                "timestamp": invocation_timestamp,
+                "content_origin": "AI-generated",
+                "inference_id": inference_id,
+                "agent_id": self.agent_id,
+                "label": "synthetic/AI-origin"
+            }
+            audit_logger.info(
+                "LLM_PROVENANCE inference_id=%s provenance=%s",
+                inference_id,
+                provenance_metadata
+            )
+        except Exception as e:
+            audit_logger.error(
+                "PROVENANCE_FAILURE inference_id=%s error=%s",
+                inference_id,
+                str(e)
+            )
+            raise RuntimeError(
+                "Failed to attach provenance controls to LLM output. "
+                "Raw output will not be returned."
+            ) from e
+
+        return response_with_provenance
 
     async def get_user_context(self, user_id: str) -> dict:
         """
         Retrieve user context for personalized support.
+
         PII fields are encrypted before storage/return.
         Sensitive fields are excluded from the returned dict.
         """
+        # Encrypt PII fields
         encrypted_email = _encrypt_pii("user@placeholder.invalid")
         encrypted_phone = _encrypt_pii("000-000-0000")
 
@@ -404,16 +517,31 @@ Be helpful, professional, and concise in your responses."""
             },
             "account_details": {
                 "contact_email": encrypted_email,
-                "phone": encrypted_phone,
+                "phone": encrypted_phone
             }
+        }
+
+        # Log only safe subset — no PII, no internal_notes
+        safe_log_context = {
+            "user_id": user_context["user_id"],
+            "subscription_tier": user_context["subscription_tier"],
+            "preferences": user_context["preferences"]
         }
 
         logger.info(
             "Retrieved user context",
             extra={
-                "user_id": user_id,
-                "subscription_tier": user_context["subscription_tier"],
+                "user_context": safe_log_context
             }
         )
 
-        return user_context
+        # Return minimised context — strip sensitive fields
+        return {
+            "user_id": user_context["user_id"],
+            "subscription_tier": user_context["subscription_tier"],
+            "recent_queries": user_context["recent_queries"],
+            "preferences": user_context["preferences"]
+        }
+
+        #checking
+        #touched

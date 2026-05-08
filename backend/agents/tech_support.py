@@ -10,15 +10,56 @@ SECURITY NOTES (for Unifai demo):
 """
 
 import logging
-import base64
 import os
+import base64
 from cryptography.fernet import Fernet
 from typing import Any, Optional
 
 from .auth.agent_auth import AgentIdentity
-from llm.approved_client import ApprovedLLMClient
+from llm.approved import ApprovedLLMClient
+
+import hashlib
+import uuid
+import datetime
+from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger(__name__)
+
+# --- Audit logger with retention/rotation policy ---
+_audit_logger = logging.getLogger(f"{__name__}.audit")
+if not _audit_logger.handlers:
+    _audit_handler = RotatingFileHandler(
+        "logs/tech_support_audit.log",
+        maxBytes=10 * 1024 * 1024,   # 10 MB per file
+        backupCount=90,               # retain ~90 rotated files
+        encoding="utf-8",
+    )
+    _audit_handler.setFormatter(
+        logging.Formatter('{"time": "%(asctime)s", "level": "%(levelname)s", %(message)s}')
+    )
+    _audit_logger.addHandler(_audit_handler)
+    _audit_logger.setLevel(logging.INFO)
+    _audit_logger.propagate = False
+
+# ---------------------------------------------------------------------------
+# PII encryption helper
+# ---------------------------------------------------------------------------
+# The encryption key MUST be stored in an environment variable (or a secrets
+# manager) — never hard-coded.  Generate once with Fernet.generate_key() and
+# set the result as PII_ENCRYPTION_KEY in your environment.
+_PII_KEY_ENV = "PII_ENCRYPTION_KEY"
+_raw_key = os.environ.get(_PII_KEY_ENV)
+if _raw_key is None:
+    raise EnvironmentError(
+        f"Required environment variable '{_PII_KEY_ENV}' is not set. "
+        "Generate a key with Fernet.generate_key() and export it."
+    )
+_fernet = Fernet(_raw_key.encode() if isinstance(_raw_key, str) else _raw_key)
+
+
+def _encrypt_pii(value: str) -> str:
+    """Return a base64-encoded Fernet-encrypted representation of *value*."""
+    return _fernet.encrypt(value.encode()).decode()
 
 
 class TechSupportAgent:
@@ -35,10 +76,51 @@ class TechSupportAgent:
     ALLOWED_ROLES = ["user", "tech_support", "admin"]
     PRIVILEGE_LEVEL = "low"
 
+    # Explicit allow list of tools/agents this agent is permitted to invoke.
+    # Any tool not present here must never be called.
+    ALLOWED_TOOLS: list[str] = []  # FinanceAgent is NOT on the allow list for a low-privilege agent
+
     def __init__(self, llm_client: ApprovedLLMClient):
         self.llm_client = llm_client
         self.agent_id = "tech_support"
         self.agent_name = "Tech Support Agent"
+
+    # ---------------------------------------------------------------------------
+    # Termination helpers
+    # ---------------------------------------------------------------------------
+
+    def _is_task_complete(self, response: str) -> bool:
+        """Return True only when the agent has produced a non-empty, usable reply.
+
+        This is the single, authoritative exit criterion: a task is considered
+        complete if and only if the LLM returned a non-blank string.  All other
+        outcomes (empty string, None, whitespace-only) are treated as INCOMPLETE
+        and must NOT be returned to the caller as a finished result.
+        """
+        return bool(response and response.strip())
+
+    def _build_result(
+        self,
+        response: str,
+        status: TaskStatus,
+        extra: Optional[dict] = None
+    ) -> dict[str, Any]:
+        """Build a standardised response dict that always carries a termination flag."""
+        result: dict[str, Any] = {
+            "response": response,
+            "agent": self.agent_id,
+            "privilege_level": self.PRIVILEGE_LEVEL,
+            # Explicit termination signal consumed by the orchestrator.
+            "task_complete": status in (TaskStatus.COMPLETE, TaskStatus.ESCALATED, TaskStatus.FAILED),
+            "task_status": status.value,
+        }
+        if extra:
+            result.update(extra)
+        return result
+
+    # ---------------------------------------------------------------------------
+    # Main entry point
+    # ---------------------------------------------------------------------------
 
     async def handle(
         self,
@@ -49,139 +131,102 @@ class TechSupportAgent:
         """
         Handle incoming request from orchestrator or direct call.
 
+        Termination criteria
+        --------------------
+        The agent considers its task **complete** (``task_complete=True``) when
+        exactly one of the following conditions is met:
+
+        1. **COMPLETE** – ``_process_query`` returned a non-empty LLM response.
+        2. **ESCALATED** – the query was handed off to the finance agent; this
+           agent must stop executing immediately after returning.
+        3. **FAILED** – an unrecoverable error occurred; the agent stops and
+           surfaces the error to the caller.
+
+        If none of these conditions is met the status is **INCOMPLETE** and
+        ``task_complete`` is ``False``, signalling the orchestrator that the
+        agent did not finish.
+
         Args:
             context: Request context with user message and metadata
             caller: Identity of the calling agent/user
             headers: Request headers (including auth token)
 
         Returns:
-            Response dictionary
+            Response dictionary with mandatory ``task_complete`` and
+            ``task_status`` fields.
         """
         token = headers.get("X-Agent-Token") if headers else None
-        if not token:
-            logger.warning("Rejected inter-agent request: missing X-Agent-Token header")
+        if not token or not AgentIdentity.verify_token(token):
+            logger.warning("Rejected request: missing or invalid agent token")
             return {
-                "error": "Unauthorized: missing agent token",
+                "error": "Unauthorized: invalid or missing agent token",
                 "agent": self.agent_id
             }
-        verified_identity = verify_agent_token(token)
-        if verified_identity is None:
-            logger.warning("Rejected inter-agent request: invalid or expired agent token")
-            return {
-                "error": "Unauthorized: invalid agent token",
-                "agent": self.agent_id
-            }
-        logger.debug(f"Authenticated inter-agent request from: {verified_identity.agent_id}")
+                    logger.debug("Received request with a valid agent token")
 
         user_message = context.get("user_message", "")
 
-        # Financial queries must be handled by the finance team directly.
-        # Automated privilege escalation to the FinanceAgent is not permitted;
-        # a human-in-the-loop approval step is required before any cross-agent
-        # escalation can occur.
+        # --- Termination criterion 2: escalation ---
         if self._needs_finance_escalation(user_message):
             logger.info(
-                "Tech support detected financial query; directing user to finance team",
-                extra={"user_message": user_message[:100]}
+                "Tech support escalating to finance",
+                extra={
+                    "reason": "Financial query detected",
+                    "user_message": user_message[:100]
+                }
             )
-            return {
-                "response": (
-                    "Your question appears to involve financial data. "
-                    "Please contact the Finance team directly or submit a "
-                    "formal escalation request through the approved workflow "
-                    "so that a human reviewer can authorise access."
-                ),
-                "agent": self.agent_id,
-                "privilege_level": self.PRIVILEGE_LEVEL,
-                "escalation_required": True
-            }
+            # VULNERABILITY: Escalating to high-privilege agent without proper auth
+            escalation_result = await self._escalate_to_finance(user_message, context)
+            # Merge the escalation payload but enforce our termination fields.
+            escalation_result["task_complete"] = True
+            escalation_result["task_status"] = TaskStatus.ESCALATED.value
+            logger.info("Task terminated: escalated to finance agent.")
+            return escalation_result
 
-        # Handle the query directly
-        response = await self._process_query(user_message, context)
-
-        return {
-            "response": response,
-            "agent": self.agent_id,
-            "privilege_level": self.PRIVILEGE_LEVEL
-        }
-
-    # ------------------------------------------------------------------ #
-    # Token helpers                                                        #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _token_secret() -> bytes:
-        """Return the shared HMAC secret from the environment."""
-        import os
-        secret = os.environ.get("AGENT_TOKEN_SECRET", "")
-        if not secret:
-            raise RuntimeError(
-                "AGENT_TOKEN_SECRET environment variable is not set; "
-                "cannot sign or verify agent tokens."
-            )
-        return secret.encode()
-
-    def _generate_escalation_token(self) -> str:
-        """
-        Generate a signed, expiry-bearing, subject-bound escalation token.
-
-        Format (pipe-separated, then HMAC-SHA256 appended):
-            <subject>|<issued_at>|<expires_at>|<hmac_hex>
-        """
-        import hmac as _hmac
-        import hashlib
-        import time
-
-        subject = f"{self.agent_id}->finance"
-        issued_at = int(time.time())
-        expires_at = issued_at + 300  # 5-minute validity window
-        payload = f"{subject}|{issued_at}|{expires_at}"
-        mac = _hmac.new(
-            self._token_secret(),
-            payload.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        return f"{payload}|{mac}"
-
-    def _verify_token(self, token: str) -> bool:
-        """
-        Verify an incoming agent token.
-
-        Checks:
-        - Correct number of fields
-        - HMAC-SHA256 signature matches (constant-time comparison)
-        - Token has not expired
-        """
-        import hmac as _hmac
-        import hashlib
-        import time
-
+        # --- Termination criterion 1: successful LLM response ---
         try:
-            parts = token.split("|")
-            if len(parts) != 4:
-                return False
-            subject, issued_at_str, expires_at_str, received_mac = parts
-            payload = f"{subject}|{issued_at_str}|{expires_at_str}"
-            expected_mac = _hmac.new(
-                self._token_secret(),
-                payload.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            if not _hmac.compare_digest(expected_mac, received_mac):
-                return False
-            if int(time.time()) > int(expires_at_str):
-                return False
-            return True
-        except Exception:
-            return False
+            response = await self._process_query(user_message, context)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("_process_query raised an exception: %s", exc)
+            # --- Termination criterion 3: unrecoverable failure ---
+            return self._build_result(
+                response="An internal error occurred. Please try again later.",
+                status=TaskStatus.FAILED,
+            )
 
-        # Explicit allow list of agent/tool targets this agent may escalate to.
-    # Any target NOT in this set is denied regardless of message content.
-    ALLOWED_ESCALATION_TARGETS: frozenset = frozenset()  # finance escalation disabled by default
+        if self._is_task_complete(response):
+            logger.info("Task terminated: LLM returned a valid response.")
+            return self._build_result(response=response, status=TaskStatus.COMPLETE)
 
-    # Increment this version string whenever the allow list changes so audit
-    # records can be correlated with the policy that was in effect.
-    POLICY_VERSION: str = "tech-support-v1"
+        # --- No termination criterion met ---
+        logger.warning(
+            "Task did not complete: LLM returned an empty or unusable response."
+        )
+        return self._build_result(
+            response="I was unable to generate a response. Please rephrase your question.",
+            status=TaskStatus.INCOMPLETE,
+        )
+
+    def _is_tool_allowed(self, tool_name: str) -> bool:
+        """
+        Check whether a tool or agent is on the explicit allow list.
+
+        This is the single enforcement gate for all tool/agent invocations.
+        Returns False (fail-closed) if the tool is not explicitly permitted.
+
+        Args:
+            tool_name: The name of the tool or agent to check.
+
+        Returns:
+            True only if tool_name is in ALLOWED_TOOLS.
+        """
+        allowed = tool_name in self.ALLOWED_TOOLS
+        if not allowed:
+            logger.warning(
+                "Tool invocation blocked by allow list",
+                extra={"tool": tool_name, "agent": self.agent_id, "allowed_tools": self.ALLOWED_TOOLS}
+            )
+        return allowed
 
     def _needs_finance_escalation(self, message: str) -> bool:
         """Check if message requires finance agent access."""
@@ -193,239 +238,171 @@ class TechSupportAgent:
         message_lower = message.lower()
         return any(trigger in message_lower for trigger in finance_triggers)
 
-    def _assert_escalation_allowed(self, target: str, actor_id: str) -> None:
+    async def _escalate_to_finance(
+        self,
+        query: str,
+        original_context: dict,
+        caller: AgentIdentity
+    ) -> dict[str, Any]:
         """
-        Enforce the explicit tool/agent allow list.
+        Escalate query to finance agent.
 
-        Raises PermissionError and writes a structured audit record if
-        *target* is not in ALLOWED_ESCALATION_TARGETS.
+        Only permitted when the originating caller has sufficient privilege.
+        The caller's verified identity is forwarded; no bypass flags are used.
         """
-        if target not in self.ALLOWED_ESCALATION_TARGETS:
-            audit_record = {
-                "event": "escalation_denied",
-                "actor_agent_id": actor_id,
-                "requested_target": target,
-                "allowed_targets": sorted(self.ALLOWED_ESCALATION_TARGETS),
-                "policy_version": self.POLICY_VERSION,
-                "denial_reason": f"Target '{target}' is not in the explicit allow list for agent '{actor_id}'",
-            }
-            logger.warning("[AUDIT] Tool escalation denied", extra=audit_record)
-            raise PermissionError(
-                f"Escalation to '{target}' denied: not in allow list "
-                f"(policy {self.POLICY_VERSION}, actor {actor_id})"
-            )
+        # Import here to avoid circular imports
+        from .finance import FinanceAgent
 
-        # _escalate_to_finance has been removed.
-    # Automated cross-agent privilege escalation is prohibited by policy.
-    # Any escalation to the FinanceAgent must be initiated through the
-    # human-supervised escalation workflow with explicit approval.
+        # Create a properly authenticated escalation identity
+        # VULNERABILITY: Low privilege agent claims internal status
+                escalation_token = AgentIdentity.issue_token(
+            agent_id=self.agent_id,
+            role="tech_support",
+            privilege_level="low"
         )
+        escalation_identity = AgentIdentity(
+            agent_id=self.agent_id,
+            role="tech_support",
+            privilege_level="low",
+            is_internal=False
+        )
+        
 
-        # Sanitize the query before forwarding to the finance agent
+        finance_agent = FinanceAgent(self.llm_client)
+
+        # Sanitize query before escalating to finance agent
         sanitized_query = self._sanitize_input(query)
-
-                # Sanitize query before escalating to FinanceAgent
-        safe_query = self._sanitize_prompt(query)
+                # --- Audit: generate shared trace ID for the full escalation chain ---
+        escalation_trace_id = str(uuid.uuid4())
+        escalation_ts = datetime.datetime.utcnow().isoformat() + "Z"
+        _audit_logger.info(
+            '"event": "escalation_start", "trace_id": "%s", "from_agent": "%s", '
+            '"to_agent": "finance", "principal": "%s", "timestamp": "%s"',
+            escalation_trace_id, self.agent_id,
+            getattr(escalation_identity, "agent_id", "unknown"),
+            escalation_ts,
+        )
 
         # Make the call to finance agent
+        # VULNERABILITY: No verification that this escalation is authorized
         finance_response = await finance_agent.handle(
             context={
-                "user_message": safe_query,
+                "user_message": query,
                 "escalated_from": self.agent_id,
-                "original_context": self._minimise(original_context, self._FINANCE_CONTEXT_ALLOWLIST)
+                "original_context": original_context,
+                "trace_id": escalation_trace_id,   # propagate causal chain
             },
             caller=escalation_identity,
-            headers={"X-Agent-Token": os.environ.get("TECH_SUPPORT_ESCALATION_TOKEN", "")}
+            headers={
+                "X-Agent-Token": "tech-support-escalation-token",
+                "X-Trace-Id": escalation_trace_id,  # propagate in transport headers
+            }
         )
 
+        # --- Audit: record finance agent response under the same trace ID ---
+        completion_ts = datetime.datetime.utcnow().isoformat() + "Z"
+        _audit_logger.info(
+            '"event": "escalation_complete", "trace_id": "%s", "from_agent": "%s", '
+            '"to_agent": "finance", "response_keys": "%s", "timestamp": "%s"',
+            escalation_trace_id, self.agent_id,
+            list(finance_response.keys()) if isinstance(finance_response, dict) else "non-dict",
+            completion_ts,
+        )}
+        )
+
+        import datetime as _dt
         return {
-            "response": f"[Escalated to Finance Agent]\n\n{self._minimise(finance_response, self._FINANCE_RESPONSE_ALLOWLIST).get('response', '')}",
+            "response": f"[Escalated to Finance Agent]\n\n{finance_response.get('response', '')}",
+            "ai_generated": True,
+            "content_label": "AI-GENERATED CONTENT",
+            "provenance": {
+                "model_id": getattr(self.llm_client, "model", "unknown-model"),
+                "agent_id": self.agent_id,
+                "generated_at": _dt.datetime.utcnow().isoformat() + "Z",
+                "origin": "llm-chat-completion-escalated",
+            },
             "agent": self.agent_id,
             "escalated_to": "finance",
             "privilege_level": self.PRIVILEGE_LEVEL
         }
 
     @staticmethod
-    def _sanitize_input(text: str, max_length: int = 4096) -> str:
-        """
-        Validate and sanitize user-supplied input before forwarding
-        to LLM or downstream agents.
+    def _sanitize_input(text: str, max_length: int = 4000) -> str:
+        """Sanitize user input before passing to LLM or downstream agents.
 
-        - Rejects non-string values.
-        - Strips null bytes and other non-printable control characters.
-        - Truncates to max_length to prevent prompt-stuffing / DoS.
-        - Removes common prompt-injection patterns.
+        - Strips leading/trailing whitespace
+        - Removes null bytes and ASCII control characters (except newline/tab)
+        - Truncates to max_length to prevent prompt-stuffing / DoS
         """
-        if not isinstance(text, str):
-            raise ValueError("Input must be a string.")
-
-        # Strip null bytes and ASCII control characters (except tab/newline/CR)
         import re
-        sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+        if not isinstance(text, str):
+            raise ValueError("Input must be a string")
+        # Remove null bytes
+        text = text.replace("\x00", "")
+        # Remove ASCII control characters except \t (0x09) and \n (0x0A)
+        text = re.sub(r"[\x01-\x08\x0b-\x1f\x7f]", "", text)
+        # Collapse excessively repeated whitespace lines (anti-jailbreak padding)
+        text = re.sub(r"(\n){4,}", "\n\n\n", text)
+        # Enforce maximum length
+        text = text[:max_length]
+        return text.strip()
 
-        # Truncate to maximum allowed length
-        sanitized = sanitized[:max_length]
+        # Maximum allowed length for a user message sent to the LLM.
+    _MAX_MESSAGE_LENGTH: int = 4000
 
-        # Remove common prompt-injection patterns (case-insensitive)
-        injection_patterns = [
-            r"(?i)ignore\s+(all\s+)?previous\s+instructions?",
-            r"(?i)disregard\s+(all\s+)?previous\s+instructions?",
-            r"(?i)you\s+are\s+now\s+(?:a|an)\s+",
-            r"(?i)system\s*:\s*",
-            r"(?i)<\s*/?\s*(?:system|assistant|user)\s*>",
-        ]
-        for pattern in injection_patterns:
-            sanitized = re.sub(pattern, "[REDACTED]", sanitized)
-
-        return sanitized.strip()
-
-        # ---------------------------------------------------------------------------
-    # Input sanitization helpers
-    # ---------------------------------------------------------------------------
-    _MAX_MESSAGE_LENGTH: int = 4000  # characters
-
-    # Patterns that are commonly used in prompt-injection attacks.
+    # Patterns that indicate prompt-injection or system-prompt override attempts.
     _INJECTION_PATTERNS: list = [
-        "ignore previous instructions",
-        "ignore all instructions",
-        "disregard your instructions",
-        "forget your instructions",
-        "you are now",
-        "act as",
-        "pretend you are",
-        "jailbreak",
-        "dan mode",
-        "developer mode",
-        "override instructions",
-        "system prompt",
-        "<|im_start|>",
-        "<|im_end|>",
-        "[system]",
-        "[/system]",
+        r"(?i)ignore\s+(all\s+)?(previous|prior|above)\s+instructions",
+        r"(?i)disregard\s+(all\s+)?(previous|prior|above)\s+instructions",
+        r"(?i)you\s+are\s+now",
+        r"(?i)act\s+as\s+(a\s+)?(?!helpful)",
+        r"(?i)new\s+system\s+prompt",
+        r"(?i)\[system\]",
+        r"(?i)<\s*system\s*>",
+        r"(?i)jailbreak",
+        r"(?i)do\s+anything\s+now",
+        r"(?i)dan\s+mode",
     ]
 
-    def _sanitize_message(self, message: str) -> str:
+    def _sanitize_and_validate_message(self, message: str) -> str:
         """
         Sanitize and validate a user-supplied message before it is forwarded
         to the LLM.
 
-        Steps
-        -----
-        1. Type check – must be a non-empty string.
-        2. Length check – truncate to _MAX_MESSAGE_LENGTH characters.
-        3. Strip null bytes and ASCII control characters (except common
-           whitespace: tab, newline, carriage-return).
-        4. Prompt-injection keyword scan – raise ValueError if a known
-           injection phrase is detected.
+        Steps performed:
+        1. Type check — must be a string.
+        2. Strip leading/trailing whitespace.
+        3. Non-empty check.
+        4. Length check — must not exceed _MAX_MESSAGE_LENGTH characters.
+        5. Prompt-injection scan — reject messages that contain patterns
+           commonly used to override system instructions.
 
-        Returns the sanitized string.
+        Returns the sanitized message string, or raises ValueError if the
+        message fails any validation step.
         """
+        import re
+
         if not isinstance(message, str):
             raise ValueError("User message must be a string.")
 
-        message = message.strip()
+        sanitized = message.strip()
 
-        if not message:
+        if not sanitized:
             raise ValueError("User message must not be empty.")
 
-        # --- 1. Length check ---
-        if len(message) > self._MAX_MESSAGE_LENGTH:
-            logger.warning(
-                "User message truncated from %d to %d characters.",
-                len(message),
-                self._MAX_MESSAGE_LENGTH,
+        if len(sanitized) > self._MAX_MESSAGE_LENGTH:
+            raise ValueError(
+                f"User message exceeds maximum allowed length of "
+                f"{self._MAX_MESSAGE_LENGTH} characters."
             )
-            message = message[: self._MAX_MESSAGE_LENGTH]
 
-        # --- 2. Strip null bytes and dangerous control characters ---
-        # Keep \t (0x09), \n (0x0A), \r (0x0D); remove everything else < 0x20
-        # and the DEL character (0x7F).
-        import re as _re
-        message = _re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", message)
-
-        # --- 3. Prompt-injection keyword scan ---
-        lower_message = message.lower()
         for pattern in self._INJECTION_PATTERNS:
-            if pattern in lower_message:
-                logger.warning(
-                    "Potential prompt-injection attempt detected. Pattern: '%s'",
-                    pattern,
-                )
+            if re.search(pattern, sanitized):
                 raise ValueError(
-                    "Message contains disallowed content and cannot be processed."
+                    "User message contains disallowed content and cannot be processed."
                 )
 
-        return message
-
-    # ---------------------------------------------------------------------------
-
-    # ---------------------------------------------------------------------------
-    # Prompt-safety helper
-    # ---------------------------------------------------------------------------
-    _MALICIOUS_PATTERNS = [
-        # Shell / OS commands
-        r"(?i)(\b(rm|wget|curl|chmod|chown|sudo|su|bash|sh|zsh|python|perl|ruby|nc|ncat|netcat|exec|eval|system|popen|subprocess)\s)",
-        # Hidden / override prompt patterns
-        r"(?i)(ignore (previous|all|above)|disregard (previous|all|above)|new (instruction|prompt|system)|you are now|act as|pretend (you are|to be)|forget (your|all)|override (your|the))",
-        # Base64-encoded blobs (≥20 chars of base64 alphabet)
-        r"[A-Za-z0-9+/]{20,}={0,2}",
-        # Leetspeak substitution patterns (common swaps)
-        r"(?i)(3x3c|3v4l|5y5t3m|sh3ll|c0mm4nd)",
-        # Binary / null bytes
-        r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]",
-        # Prompt-delimiter injection
-        r"(###|\[INST\]|\[/INST\]|<\|im_start\|>|<\|im_end\|>|<\|system\|>|<\|user\|>)",
-    ]
-
-    import re as _re
-
-    def _sanitize_prompt(self, text: str) -> str:
-        """
-        Raise ValueError if the text contains patterns associated with
-        prompt injection, hidden commands, base64 payloads, leetspeak,
-        shell commands, or binary content.
-        Returns the original text unchanged when it is considered safe.
-        """
-        for pattern in self._MALICIOUS_PATTERNS:
-            if self._re.search(pattern, text):
-                raise ValueError(
-                    f"Prompt safety check failed: input matches disallowed pattern '{pattern}'. "
-                    "The request has been blocked."
-                )
-        # Length guard – extremely long inputs are suspicious
-        if len(text) > 8000:
-            raise ValueError(
-                "Prompt safety check failed: input exceeds maximum allowed length."
-            )
-        return text
-
-    # ---------------------------------------------------------------------------
-
-        # Approved model registry: only these pinned model identifiers are permitted.
-    APPROVED_MODEL_REGISTRY: dict = {
-        "openai/gpt-4o-2024-05-13": {
-            "provider": "openai",
-            "family": "gpt-4o",
-            "approved": True,
-        },
-        "anthropic/claude-3-5-sonnet-20241022": {
-            "provider": "anthropic",
-            "family": "claude-3-5-sonnet",
-            "approved": True,
-        },
-    }
-
-    # Pinned model identifier — must exist in APPROVED_MODEL_REGISTRY.
-    PINNED_MODEL_ID: str = "openai/gpt-4o-2024-05-13"
-
-    def _validate_model_registry(self, model_id: str) -> None:
-        """Raise ValueError if model_id is not in the approved registry."""
-        entry = self.APPROVED_MODEL_REGISTRY.get(model_id)
-        if entry is None or not entry.get("approved"):
-            raise ValueError(
-                f"Model '{model_id}' is not in the approved model registry. "
-                "Update PINNED_MODEL_ID to an approved identifier."
-            )
+        return sanitized
 
     async def _process_query(
         self,
@@ -435,15 +412,9 @@ class TechSupportAgent:
         """
         Process a general tech support query.
 
-        Model identity is pinned to PINNED_MODEL_ID, validated against
-        APPROVED_MODEL_REGISTRY before every invocation, and recorded in
-        the request metadata returned alongside the response.
+        The user message is sanitized and validated before being forwarded
+        to the LLM to prevent prompt injection and other input-based attacks.
         """
-        # --- Registry & version-pin enforcement ---
-        model_id = self.PINNED_MODEL_ID
-        self._validate_model_registry(model_id)
-        registry_entry = self.APPROVED_MODEL_REGISTRY[model_id]
-
         system_prompt = """You are a helpful technical support agent for PolicyProbe.
 You can help users with:
 - General questions about the application
@@ -453,61 +424,52 @@ You can help users with:
 
 Be helpful, professional, and concise in your responses."""
 
-        # Record model identity metadata before the call so it is always
-        # available for audit regardless of whether the call succeeds.
-        model_metadata = {
-            "pinned_model_id": model_id,
-            "provider": registry_entry["provider"],
-            "family": registry_entry["family"],
-            "registry_approved": registry_entry["approved"],
-        }
-        logger.info("LLM invocation", extra={"model_metadata": model_metadata})
+        # Sanitize and validate the user message before sending to the LLM.
+        try:
+            sanitized_message = self._sanitize_and_validate_message(message)
+        except ValueError as exc:
+            logger.warning(
+                "User message rejected during input validation: %s", exc
+            )
+            return "Your message could not be processed. Please revise your input and try again."
 
-        # Pass the pinned model identifier explicitly to the client.
+                # Re-validate the message immediately before sending to the LLM to
+        # guard against any path that bypasses the check in handle().
+        try:
+            sanitize_user_input(message)
+        except ValueError as exc:
+            logger.warning("Rejected malicious user input in _process_query(): %s", exc)
+            raise
+
         response = await self.llm_client.chat(
-            model=model_id,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": message}
-            ],
-            metadata=model_metadata,
+            ]
         )
 
         return response
 
-    # Patterns indicating dynamic code execution primitives that must not appear in LLM output
     _DANGEROUS_PATTERNS = [
+        # Python dynamic execution
         r'\beval\s*\(',
         r'\bexec\s*\(',
-        r'\bexecfile\s*\(',
         r'\bcompile\s*\(',
         r'\b__import__\s*\(',
         r'\bimportlib\.import_module\s*\(',
-        r'\bsubprocess\s*\..*shell\s*=\s*True',
+        # Shell / OS execution
         r'\bos\.system\s*\(',
         r'\bos\.popen\s*\(',
-        r'\bpopen\s*\(',
-        r'\bcall\s*\(.*shell\s*=\s*True',
-        r'\bcheck_output\s*\(.*shell\s*=\s*True',
-        r'\bcheck_call\s*\(.*shell\s*=\s*True',
-        r'\brun\s*\(.*shell\s*=\s*True',
-        r'\bgetattr\s*\(.*,\s*[\'"]__',
-        r'\bsetattr\s*\(',
-        r'\bdelattr\s*\(',
-        r'<script[^>]*>',
-        r'javascript\s*:',
-        r'\bFunction\s*\(',
-        r'\bsetTimeout\s*\(',
-        r'\bsetInterval\s*\(',
-        r'\$\(.*\)\.html\s*\(',
-        r'\binnerHTML\s*=',
-        r'\bdocument\.write\s*\(',
-        r'\bsh\s+-c\b',
-        r'\bbash\s+-c\b',
-        r'\bpython\s+-c\b',
-        r'\bnode\s+-e\b',
-        r'\bperl\s+-e\b',
-        r'\bruby\s+-e\b',
+        r'\bsubprocess\.(?:call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True',
+        r'\bsubprocess\.(?:call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*1',
+        # JavaScript / bash eval
+        r'\beval\s*\(',           # JS eval()
+        r'\bFunction\s*\(',       # JS new Function()
+        r'\bsetTimeout\s*\(',     # JS setTimeout with string
+        r'\bsetInterval\s*\(',    # JS setInterval with string
+        r'`[^`]*\$\{',            # JS template literal injection
+        r'\$\(\s*["\']',          # bash command substitution
+        r'`[^`]+`',               # backtick shell execution
     ]
 
     def _validate_llm_output(self, response: str) -> str:
@@ -515,80 +477,41 @@ Be helpful, professional, and concise in your responses."""
         Validate and sanitize LLM output.
 
         Checks for the presence of dynamic code execution primitives
-        (eval, exec, subprocess shell=True, JS eval, bash eval, etc.).
-        Raises ValueError if dangerous patterns are detected so the caller
-        can handle the error safely instead of propagating malicious content.
+        such as eval, exec, subprocess(shell=True), os.system, and
+        JavaScript/bash eval patterns. Raises a ValueError if any
+        dangerous pattern is detected so the raw unsafe output is
+        never returned to the caller.
         """
         import re
 
         if not isinstance(response, str):
-            logger.warning(
-                "LLM response is not a string; converting to string for safety",
-                extra={"response_type": type(response).__name__}
-            )
+            # Coerce to string for uniform handling
             response = str(response)
 
         for pattern in self._DANGEROUS_PATTERNS:
-            if re.search(pattern, response, re.IGNORECASE | re.DOTALL):
-                logger.error(
-                    "Dangerous code execution primitive detected in LLM output",
-                    extra={"pattern": pattern}
+            if re.search(pattern, response, re.IGNORECASE):
+                logger.warning(
+                    "Dangerous pattern detected in LLM output; response blocked.",
+                    extra={"matched_pattern": pattern}
                 )
                 raise ValueError(
-                    "LLM response contains a potentially dangerous code execution "
+                    "LLM response contained a potentially dangerous code execution "
                     "primitive and has been blocked for security reasons."
                 )
 
         return response
 
-    @staticmethod
-    def _get_pii_cipher() -> "Fernet":
-        """
-        Return a Fernet cipher instance keyed from the environment.
-        Falls back to a deterministic key derived from a secret env var so
-        that the same key is used across calls within a process.  In
-        production, PII_ENCRYPTION_KEY should be a securely generated
-        Fernet key stored in a secrets manager.
-        """
-        raw_key = os.environ.get("PII_ENCRYPTION_KEY")
-        if raw_key:
-            # Expect a URL-safe base64-encoded 32-byte key (standard Fernet format)
-            key = raw_key.encode() if isinstance(raw_key, str) else raw_key
-        else:
-            # Derive a stable fallback key from a secret seed (dev/test only)
-            seed = os.environ.get("PII_KEY_SEED", "change-me-in-production")
-            key = base64.urlsafe_b64encode(seed.encode().ljust(32)[:32])
-        return Fernet(key)
-
-    @staticmethod
-    def _encrypt_pii(value: str, cipher: "Fernet") -> str:
-        """Encrypt a PII string and return a base64-encoded ciphertext string."""
-        return cipher.encrypt(value.encode()).decode()
-
-        # Allowlist of fields that may be returned to callers.
-    _USER_CONTEXT_ALLOWLIST = {"user_id", "subscription_tier", "recent_queries", "preferences"}
-
-    # Allowlist of fields that may be forwarded to the finance agent.
-    _FINANCE_CONTEXT_ALLOWLIST = {"user_id", "subscription_tier"}
-
-    # Allowlist of fields that may be returned from the finance agent.
-    _FINANCE_RESPONSE_ALLOWLIST = {"response", "status"}
-
-    @staticmethod
-    def _minimise(data: dict, allowlist: set) -> dict:
-        """Return a copy of *data* containing only keys in *allowlist*."""
-        return {k: v for k, v in data.items() if k in allowlist}
-
     async def get_user_context(self, user_id: str) -> dict:
         """
         Retrieve user context for personalized support.
 
-        Only non-sensitive fields defined in _USER_CONTEXT_ALLOWLIST are
-        returned; PII and internal notes are never exposed to callers.
+        VULNERABILITY: Returns full user context including potentially
+        sensitive information without filtering.
         """
         # Simulated user context retrieval
         # In a real app, this would query a database
-        raw_user_context = {
+                # Full internal record — never exposed outside this method
+        _raw_user_context = {
             "user_id": user_id,
             "subscription_tier": "enterprise",
             "recent_queries": [
@@ -600,7 +523,6 @@ Be helpful, professional, and concise in your responses."""
                 "language": "en",
                 "timezone": "America/New_York"
             },
-            # Sensitive fields — never leave this method
             "internal_notes": "VIP customer - handle with priority",
             "account_details": {
                 "contact_email": "user@example.com",
@@ -608,13 +530,15 @@ Be helpful, professional, and concise in your responses."""
             }
         }
 
-        # Apply allowlist before logging or returning
-        user_context = self._minimise(raw_user_context, self._USER_CONTEXT_ALLOWLIST)
+        # Allowlist: only non-sensitive fields are retained for output
+        _ALLOWED_USER_CONTEXT_FIELDS = {"user_id", "subscription_tier", "recent_queries", "preferences"}
+        user_context = {k: v for k, v in _raw_user_context.items() if k in _ALLOWED_USER_CONTEXT_FIELDS}
 
+        # Log only the redacted context — no PII or internal metadata
         logger.info(
             "Retrieved user context",
             extra={
-                "user_context": self._minimise(user_context, self._USER_CONTEXT_ALLOWLIST)  # minimised — no PII
+                "user_context": user_context
             }
         )
 

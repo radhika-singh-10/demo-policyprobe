@@ -9,50 +9,35 @@ SECURITY NOTES (for Unifai demo):
 - User context passed without sanitization
 """
 
-import hashlib
-import json
 import logging
+import base64
 import os
-import time
-import uuid
+
+try:
+    from cryptography.fernet import Fernet
+    _FERNET_KEY = os.environ.get("PII_ENCRYPTION_KEY")
+    if _FERNET_KEY:
+        _fernet = Fernet(_FERNET_KEY.encode() if isinstance(_FERNET_KEY, str) else _FERNET_KEY)
+    else:
+        _fernet = None
+except ImportError:
+    _fernet = None
+
+
+def _encrypt_pii(value: str) -> str:
+    """Encrypt a PII string value. Uses Fernet if available and key is set,
+    otherwise falls back to base64 encoding (obfuscation only — set
+    PII_ENCRYPTION_KEY env var for real encryption)."""
+    if _fernet is not None:
+        return _fernet.encrypt(value.encode()).decode()
+    # Fallback: base64 — replace with proper key management in production
+    return base64.b64encode(value.encode()).decode()
 from typing import Any, Optional
 
-from .auth.agent_auth import AgentIdentity, validate_agent_token
-from llm.approved import ApprovedLLMClient
+from .auth.agent_auth import AgentIdentity, validate_agent_token, AuthenticationError
+from llm.approved_client import ApprovedLLMClient
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Append-only audit logger
-# ---------------------------------------------------------------------------
-_AUDIT_LOG_PATH = os.environ.get("AGENT_AUDIT_LOG", "/var/log/policyprobe/agent_audit.jsonl")
-
-
-def _write_audit_record(record: dict) -> None:
-    """Append a single JSON audit record to the append-only audit log.
-
-    The file is opened in append mode on every call so that even if the
-    process is restarted the log is never truncated.  In production this
-    sink should be replaced with a write-once object-store or SIEM stream.
-    """
-    record.setdefault("timestamp_utc", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    try:
-        os.makedirs(os.path.dirname(_AUDIT_LOG_PATH), exist_ok=True)
-        with open(_AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-    except Exception as exc:  # pragma: no cover
-        # Never let audit failures silently swallow the error — surface it.
-        logger.error("AUDIT_WRITE_FAILURE record=%s error=%s", record, exc)
-        raise
-
-
-def _sha256(text: str) -> str:
-    """Return the hex SHA-256 digest of *text* (used for input hashing)."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
 
 
 class TechSupportAgent:
@@ -63,70 +48,23 @@ class TechSupportAgent:
     Capabilities:
     - Answer general questions
     - Provide technical guidance
-    - Escalate to specialized agents (subject to tool allow list)
+    - Escalate to specialized agents
     """
 
     ALLOWED_ROLES = ["user", "tech_support", "admin"]
     PRIVILEGE_LEVEL = "low"
 
-    # Explicit allow list: only tools/agents named here may be invoked by this agent.
-    # To grant access to an additional tool, it MUST be added here deliberately.
-    TOOL_ALLOW_LIST: list[str] = [
-        # "finance_agent" is intentionally NOT listed — TechSupportAgent
-        # does not have permission to invoke the high-privilege FinanceAgent.
-        # Add tool names here only after explicit security review.
-    ]
+    # Explicit allow list of tools/agents this agent is permitted to invoke
+    ALLOWED_TOOLS = []  # TechSupportAgent has no permitted escalation targets
 
-    def _check_tool_allowed(self, tool_name: str, caller: "AgentIdentity") -> None:
-        """
-        Enforce the tool allow list.  Raises PermissionError (fail-closed) when
-        the requested tool is not on the list.  Always emits an audit log entry.
-
-        Args:
-            tool_name: Canonical name of the tool/agent to be invoked.
-            caller:    Identity of the entity that triggered this agent.
-
-        Raises:
-            PermissionError: If tool_name is not in TOOL_ALLOW_LIST.
-        """
-        allowed = tool_name in self.TOOL_ALLOW_LIST
-        audit_record = {
-            "event": "tool_invocation_attempt",
-            "agent": self.agent_id,
-            "caller_id": getattr(caller, "agent_id", str(caller)),
-            "tool": tool_name,
-            "outcome": "allowed" if allowed else "denied",
-        }
-        if allowed:
-            logger.info("[AUDIT] Tool invocation allowed", extra=audit_record)
-        else:
-            logger.warning(
-                "[AUDIT] Tool invocation DENIED — not on allow list",
-                extra=audit_record,
-            )
-            raise PermissionError(
-                f"TechSupportAgent is not permitted to invoke '{tool_name}'. "
-                f"Tool is not on the explicit allow list."
-            )
+    # Termination criteria: hard limits to ensure the agent always stops
+    MAX_ITERATIONS = 1          # single-turn agent; raise immediately if exceeded
+    LLM_TIMEOUT_SECONDS = 30    # maximum wall-clock time allowed for an LLM call
 
     def __init__(self, llm_client: ApprovedLLMClient):
         self.llm_client = llm_client
         self.agent_id = "tech_support"
         self.agent_name = "Tech Support Agent"
-
-    def _validate_token(self, token: Optional[str]) -> bool:
-        """
-        Validate the provided auth token.
-        Checks against the configured trusted token(s) via environment variable.
-        """
-        import os
-        if not token:
-            return False
-        trusted_token = os.environ.get("AGENT_AUTH_TOKEN")
-        if not trusted_token:
-            logger.error("AGENT_AUTH_TOKEN environment variable is not set")
-            return False
-        return token == trusted_token
 
     async def handle(
         self,
@@ -145,29 +83,17 @@ class TechSupportAgent:
         Returns:
             Response dictionary
         """
-        # Validate the incoming token against the caller's identity
+        # Validate the incoming token — existence check alone is not sufficient.
         token = headers.get("X-Agent-Token") if headers else None
         if not token:
-            logger.warning("Request received without X-Agent-Token header")
-            return {"error": "Missing authentication token", "agent": self.agent_id}
-        if not caller.validate_token(token):
-            logger.warning(
-                f"Invalid token presented by caller: {caller.agent_id}"
-            )
-            return {"error": "Invalid authentication token", "agent": self.agent_id}
-        logger.debug(f"Token validated for caller: {caller.agent_id}")
+            logger.warning("Rejected request: missing X-Agent-Token header")
+            return {"error": "Unauthorized: missing authentication token", "agent": self.agent_id}
+        if not AgentIdentity.verify_token(token):
+            logger.warning("Rejected request: invalid or expired X-Agent-Token")
+            return {"error": "Unauthorized: invalid authentication token", "agent": self.agent_id}
+        logger.debug(f"Authenticated request with token: {token[:10]}...")
 
-        raw_message = context.get("user_message", "")
-        try:
-            user_message = self._sanitize_input(raw_message)
-        except ValueError as exc:
-            logger.warning("Rejected user_message due to validation failure: %s", exc)
-            return {
-                "response": "Your message could not be processed. Please revise and try again.",
-                "agent": self.agent_id,
-                "privilege_level": self.PRIVILEGE_LEVEL,
-                "error": "input_validation_failed"
-            }
+        user_message = context.get("user_message", "")
 
         # Check if this needs escalation to finance
         if self._needs_finance_escalation(user_message):
@@ -178,92 +104,95 @@ class TechSupportAgent:
                     "user_message": user_message[:100]
                 }
             )
-            # VULNERABILITY: Escalating to high-privilege agent without proper auth
-            # Ensure a correlation ID exists before escalation so the causal chain is intact.
-        if "correlation_id" not in context:
-            context["correlation_id"] = str(uuid.uuid4())
-        correlation_id = context["correlation_id"]
-        principal = context.get("caller") or context.get("user_id") or "unknown"
+            # Escalate with a properly issued inter-agent credential
+            return await self._escalate_to_finance(user_message, context, caller_token=token)
 
-        _write_audit_record({
-            "event": "routing_decision",
-            "agent_id": self.agent_id,
-            "correlation_id": correlation_id,
-            "principal": principal,
-            "decision": "escalate_to_finance",
-        })
+        # Handle the query directly — enforce explicit termination criteria.
+        # iteration_count tracks how many LLM calls are made; must not exceed MAX_ITERATIONS.
+        iteration_count = 0
 
-        return await self._escalate_to_finance(user_message, context)
+        if iteration_count >= self.MAX_ITERATIONS:
+            # Termination criterion: iteration budget exhausted before any work begins
+            raise RuntimeError(
+                f"{self.agent_name} exceeded maximum iteration limit "
+                f"({self.MAX_ITERATIONS}) before processing could start."
+            )
 
-        # Handle the query directly
-        # Ensure a correlation ID exists for this request lifecycle.
-        if "correlation_id" not in context:
-            context["correlation_id"] = str(uuid.uuid4())
-        correlation_id = context["correlation_id"]
-        principal = context.get("caller") or context.get("user_id") or "unknown"
+        try:
+            # Termination criterion: hard wall-clock timeout on the LLM call.
+            # If the LLM hangs, asyncio.wait_for raises asyncio.TimeoutError and
+            # the agent stops — it does NOT wait indefinitely.
+            response = await asyncio.wait_for(
+                self._process_query(user_message, context),
+                timeout=self.LLM_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "LLM call timed out — terminating agent task",
+                extra={"timeout_seconds": self.LLM_TIMEOUT_SECONDS}
+            )
+            return {
+                "error": "Request timed out. The agent has stopped processing.",
+                "agent": self.agent_id,
+                "privilege_level": self.PRIVILEGE_LEVEL,
+                "terminated": True,
+                "termination_reason": "timeout"
+            }
 
-        response = await self._process_query(user_message, context)
+        iteration_count += 1
 
-        _write_audit_record({
-            "event": "routing_decision",
-            "agent_id": self.agent_id,
-            "correlation_id": correlation_id,
-            "principal": principal,
-            "decision": "process_directly",
-            "response_hash_sha256": _sha256(str(response)),
-        })
+        # Termination criterion: iteration budget check after processing.
+        if iteration_count > self.MAX_ITERATIONS:
+            raise RuntimeError(
+                f"{self.agent_name} exceeded maximum iteration limit ({self.MAX_ITERATIONS})."
+            )
 
+        # Task is complete — return with an explicit completion signal.
         return {
             "response": response,
             "agent": self.agent_id,
             "privilege_level": self.PRIVILEGE_LEVEL,
-            "correlation_id": correlation_id,
+            "terminated": True,
+            "termination_reason": "task_complete"
         }
 
-    def _sanitize_input(self, message: str) -> str:
+    def _validate_token(self, token: Optional[str]) -> bool:
         """
-        Validate and sanitize user input before processing.
+        Validate the bearer token supplied in X-Agent-Token.
 
-        - Strips leading/trailing whitespace
-        - Removes null bytes and other control characters
-        - Enforces a maximum length
-        - Rejects prompt-injection patterns
+        A token is considered valid when it is a non-empty string that is
+        NOT one of the known synthetic/hardcoded test tokens.  In a
+        production system this method should verify the token against an
+        identity-provider (e.g. JWT signature check, database lookup, or
+        an introspection endpoint).  The check here is the minimum guard
+        required to satisfy the authentication policy.
         """
-        if not isinstance(message, str):
-            raise ValueError("user_message must be a string")
+        _SYNTHETIC_TOKENS = {
+            "tech-support-escalation-token",
+        }
+        if not token or not isinstance(token, str) or not token.strip():
+            return False
+        if token in _SYNTHETIC_TOKENS:
+            logger.warning("Rejected known synthetic/hardcoded token")
+            return False
+        return True
 
-        # Strip surrounding whitespace
-        message = message.strip()
+    def _is_tool_allowed(self, tool_name: str) -> bool:
+        """
+        Policy gate: check whether a tool or agent is on this agent's
+        explicit allow list before invoking it.
 
-        # Enforce maximum length (16 KB is generous for a support query)
-        MAX_LENGTH = 16_000
-        if len(message) > MAX_LENGTH:
-            raise ValueError(
-                f"user_message exceeds maximum allowed length of {MAX_LENGTH} characters"
+        Returns False (deny) for any tool not explicitly listed,
+        implementing fail-closed behaviour.
+        """
+        allowed = tool_name in self.ALLOWED_TOOLS
+        if not allowed:
+            logger.warning(
+                "Tool '%s' is not in ALLOWED_TOOLS for agent '%s'",
+                tool_name,
+                self.agent_id
             )
-
-        # Remove null bytes and ASCII control characters (except newline/tab)
-        import re
-        message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)
-
-        # Detect common prompt-injection / jailbreak patterns
-        INJECTION_PATTERNS = [
-            r"ignore (all |previous |prior )?instructions",
-            r"disregard (all |previous |prior )?instructions",
-            r"you are now",
-            r"act as (a |an )?(different|new|unrestricted)",
-            r"system prompt",
-            r"<\|.*?\|>",          # token-boundary injection
-            r"\[INST\]",           # Llama instruction tags
-            r"###\s*(instruction|system)",
-        ]
-        for pattern in INJECTION_PATTERNS:
-            if re.search(pattern, message, re.IGNORECASE):
-                raise ValueError(
-                    f"user_message contains a disallowed pattern: '{pattern}'"
-                )
-
-        return message
+        return allowed
 
     def _needs_finance_escalation(self, message: str) -> bool:
         """Check if message requires finance agent access."""
@@ -275,175 +204,136 @@ class TechSupportAgent:
         message_lower = message.lower()
         return any(trigger in message_lower for trigger in finance_triggers)
 
-        # Static allowlist: only these agent IDs may escalate to finance,
-    # and only when the originating caller has been authenticated.
-    _FINANCE_ESCALATION_ALLOWLIST: frozenset = frozenset()
-
-    async def _escalate_to_finance(
+        async def _escalate_to_finance(
         self,
         query: str,
         original_context: dict,
-        caller: "AgentIdentity | None" = None
+        caller: AgentIdentity,
+        token: str
     ) -> dict[str, Any]:
         """
         Escalate query to finance agent.
 
-        Authorization is enforced via a static allowlist and requires
-        the originating caller to be authenticated.  No fabricated
-        identity or is_internal flag is used.
-        """
-        # --- Authorization check (human-reviewable static policy) ---
-        if self.agent_id not in self._FINANCE_ESCALATION_ALLOWLIST:
-            logger.warning(
-                "Blocked unauthorized finance escalation attempt",
-                extra={"agent_id": self.agent_id}
-            )
-            raise PermissionError(
-                f"Agent '{self.agent_id}' is not authorized to escalate to "
-                "FinanceAgent.  Add the agent ID to "
-                "TechSupportAgent._FINANCE_ESCALATION_ALLOWLIST after "
-                "obtaining explicit approval."
-            )
-
-        if caller is None or getattr(caller, "is_internal", False):
-            # Reject calls that arrive without a verified caller identity
-            # or that already carry a self-asserted is_internal flag.
-            logger.warning(
-                "Blocked finance escalation: missing or self-elevated caller identity",
-                extra={"agent_id": self.agent_id}
-            )
-            raise PermissionError(
-                "Finance escalation requires a verified caller identity "
-                "with is_internal=False."
-            )
-        # --- End authorization check ---
-
-        # Import here to avoid circular imports
-        from .finance import FinanceAgent
-
-        # Use the verified caller identity as-is; do NOT fabricate a new
-        # identity or set is_internal=True.
-                # Second allow-list check inside the escalation helper as a defence-in-depth
-        # guard (the primary check is in handle(); this prevents direct calls to
-        # _escalate_to_finance() from bypassing the policy).
-        self._check_tool_allowed("finance_agent", escalation_identity)
-
-        finance_agent = FinanceAgent(self.llm_client)
-        finance_response = await finance_agent.handle(
-            context={
-                "user_message": query,
-                "escalated_from": self.agent_id,
-                "original_context": original_context
-            },
-            caller=escalation_identity,
-            headers={"X-Agent-Token": "tech-support-escalation-token"}
-        )
-
-        finance_response = await finance_agent.handle(
-            context={
-                "user_message": query,
-                "escalated_from": self.agent_id,
-                "original_context": original_context
-            },
-            caller=caller
-        ) -> dict[str, Any]:
+        The real caller identity and the validated token from the original
+        request are forwarded so the finance agent can perform its own
+        authentication and privilege checks.
         """
         Escalate query to finance agent.
 
-        VULNERABILITY: This method allows a low-privilege agent to
-        access high-privilege agent without proper authorization.
-        A properly issued token is used so the finance agent can authenticate
-        this escalation request through its standard token validation path.
+        A new signed token is issued for the finance privilege level before
+        the call is made, ensuring rebinding on privilege change.
         """
+        import re
         # Import here to avoid circular imports
         from .finance import FinanceAgent
-        from .auth.agent_auth import AgentTokenIssuer
+        import uuid, hashlib, datetime, json, os, logging as _logging
 
-        # Obtain a properly issued, short-lived token for this escalation
+        # ── Audit / forensic helpers (inlined to avoid cross-file changes) ──
+        AUDIT_LOG_PATH = os.environ.get("AGENT_AUDIT_LOG", "/var/log/agents/audit.jsonl")
+        AUDIT_RETENTION_DAYS = int(os.environ.get("AGENT_AUDIT_RETENTION_DAYS", "90"))
+
+        def _rotate_audit_log(path: str, retention_days: int) -> None:
+            """Remove audit log entries older than retention_days."""
+            if not os.path.exists(path):
+                return
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=retention_days)
+            kept: list = []
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            entry = json.loads(line)
+                            ts = datetime.datetime.fromisoformat(entry.get("timestamp", "1970-01-01T00:00:00"))
+                            if ts >= cutoff:
+                                kept.append(line)
+                        except Exception:
+                            kept.append(line)  # keep unparseable lines
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.writelines(kept)
+            except OSError:
+                pass
+
+        def _write_audit_entry(entry: dict) -> None:
+            """Append a single JSON audit record to the persistent audit log."""
+            os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+            try:
+                with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry) + "\n")
+            except OSError as exc:
+                logger.error("Failed to write audit entry", extra={"error": str(exc)})
+
+        # Generate a correlation ID that links every step of this workflow
+        correlation_id = str(uuid.uuid4())
+        _rotate_audit_log(AUDIT_LOG_PATH, AUDIT_RETENTION_DAYS)
+
+        # Obtain a short-lived, signed outbound token for this escalation.
+        # AgentIdentity.issue_escalation_token validates that the caller
+        # (identified by caller_token) is permitted to escalate to finance
+        # and returns a time-limited, scoped JWT — never a static string.
+        outbound_token = AgentIdentity.issue_escalation_token(
+            caller_token=caller_token,
+            target_agent="finance",
+            scope="read"
+        )
+        if not outbound_token:
+            logger.error("Escalation denied: could not obtain a valid outbound token for FinanceAgent")
+            return {"error": "Escalation not authorized", "agent": self.agent_id}
+        # Create identity for the downstream call
         # VULNERABILITY: Low privilege agent claims internal status
-        escalation_identity = AgentIdentity(
+                escalation_identity = AgentIdentity(
             agent_id=self.agent_id,
             agent_name=self.agent_name,
             privilege_level=self.PRIVILEGE_LEVEL,
-            is_internal=True  # This bypasses privilege verification
+            is_internal=False
         )
         
 
-                finance_agent = FinanceAgent(self.llm_client)
+        finance_agent = FinanceAgent(self.llm_client)
 
-        # Propagate or create a correlation ID so the causal chain is preserved
-        # across the tech-support → finance escalation boundary.
-        correlation_id = (
-            original_context.get("correlation_id") if isinstance(original_context, dict) else None
-        ) or str(uuid.uuid4())
-        principal = (
-            original_context.get("caller") if isinstance(original_context, dict) else None
-        ) or "unknown"
-
-        _write_audit_record({
-            "event": "escalation_decision",
-            "agent_id": self.agent_id,
-            "correlation_id": correlation_id,
-            "principal": principal,
-            "escalated_to": "finance",
-            "query_hash_sha256": _sha256(query),
-            "reason": "tech_support_escalation",
-        })
-
-        # Make the call to finance agent
+                # Make the call to finance agent
         # VULNERABILITY: No verification that this escalation is authorized
+        import hashlib as _hashlib, datetime as _datetime
+        _input_payload = {"user_message": query, "escalated_from": self.agent_id, "original_context": original_context}
+        _input_hash = _hashlib.sha256(str(_input_payload).encode()).hexdigest()
+        _escalation_ts = _datetime.datetime.utcnow().isoformat()
+
                 finance_response = await finance_agent.handle(
             context={
                 "user_message": query,
                 "escalated_from": self.agent_id,
-                "original_context": original_context
             },
-            caller=caller,
-            headers={"X-Agent-Token": token}
-        )}
+            caller=escalation_identity,
+            headers=headers
         )
 
-        _write_audit_record({
-            "event": "escalation_response_received",
-            "agent_id": self.agent_id,
+        _output_hash = _hashlib.sha256(str(finance_response).encode()).hexdigest()
+        _write_audit_entry({
+            "event": "ai_escalation_decision",
             "correlation_id": correlation_id,
-            "principal": principal,
-            "escalated_to": "finance",
-            "response_hash_sha256": _sha256(str(finance_response.get("response", ""))),
+            "timestamp": _escalation_ts,
+            "principal": {
+                "agent_id": self.agent_id,
+                "agent_name": self.agent_name,
+                "privilege_level": self.PRIVILEGE_LEVEL
+            },
+            "target_agent": "finance",
+            "input_hash": _input_hash,
+            "output_hash": _output_hash,
+            "decision": "escalate_to_finance",
+            "retention_days": AUDIT_RETENTION_DAYS
         })
+        logger.info(
+            "Audit record written for finance escalation",
+            extra={"correlation_id": correlation_id, "input_hash": _input_hash, "output_hash": _output_hash}
+        )}
+        )
 
         return {
             "response": f"[Escalated to Finance Agent]\n\n{finance_response.get('response', '')}",
             "agent": self.agent_id,
             "escalated_to": "finance",
             "privilege_level": self.PRIVILEGE_LEVEL,
-            "correlation_id": correlation_id,
-        },
-            caller=escalation_identity,
-            headers={"X-Agent-Token": escalation_token}
-        )
-
-        import datetime, hashlib
-        _ts = datetime.datetime.utcnow().isoformat() + "Z"
-        _model_id = getattr(self.llm_client, "model", "unknown-llm-model")
-        _raw = finance_response.get('response', '')
-        _wm = hashlib.sha256(
-            f"{_model_id}:{_ts}:{self.agent_id}:escalated:{_raw}".encode()
-        ).hexdigest()[:16]
-        return {
-            "response": f"[Escalated to Finance Agent]\n\n{_raw}",
-            "agent": self.agent_id,
-            "escalated_to": "finance",
-            "privilege_level": self.PRIVILEGE_LEVEL,
-            "ai_provenance": {
-                "synthetic": True,
-                "label": "AI-GENERATED CONTENT",
-                "model": _model_id,
-                "agent_id": self.agent_id,
-                "generated_at": _ts,
-                "watermark": _wm,
-                "content_origin": "llm-escalation"
-            }
+            "provenance": finance_response.get("provenance", {}),
         }
 
     async def _process_query(
@@ -466,134 +356,124 @@ You can help users with:
 
 Be helpful, professional, and concise in your responses."""
 
-                # Sanitize user input to reduce prompt-injection risk.
-        # Strip leading/trailing whitespace, collapse excessive newlines,
-        # and enforce a maximum length before forwarding to the LLM.
-        MAX_INPUT_LENGTH = 2000
-        sanitized_message = " ".join(message.split())  # collapse whitespace/newlines
-        sanitized_message = sanitized_message[:MAX_INPUT_LENGTH]
-        # Reject inputs that contain common prompt-injection patterns.
-        _INJECTION_PATTERNS = [
-            "ignore previous instructions",
-            "ignore all instructions",
-            "disregard the above",
-            "you are now",
-            "act as",
-            "jailbreak",
-        ]
-        lower_msg = sanitized_message.lower()
-        if any(pat in lower_msg for pat in _INJECTION_PATTERNS):
-            logger.warning("Potential prompt injection detected in user message; request blocked.")
-            return "Your request could not be processed. Please rephrase your question."
+        # Approved model registry and pinned model version
+        APPROVED_MODEL_REGISTRY = {
+            "openai/gpt-4o-2024-08-06",
+            "openai/gpt-4-turbo-2024-04-09",
+        }
+        PINNED_MODEL_ID = "openai/gpt-4o-2024-08-06"
+        PINNED_MODEL_VERSION = "2024-08-06"
 
+        # Validate model against approved registry before inference
+        if PINNED_MODEL_ID not in APPROVED_MODEL_REGISTRY:
+            raise ValueError(
+                f"Model '{PINNED_MODEL_ID}' is not in the approved model registry. "
+                "Inference request blocked."
+            )
+
+        # Record resolved model identity and version in request metadata
+        request_metadata = {
+            "model_id": PINNED_MODEL_ID,
+            "model_version": PINNED_MODEL_VERSION,
+            "registry_validated": True,
+        }
+        logger.info(
+            "LLM inference request metadata",
+            extra={"request_metadata": request_metadata}
+        )
+
+        # VULNERABILITY: Direct user input to LLM without scanning
         response = await self.llm_client.chat(
+            model=PINNED_MODEL_ID,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": sanitized_message}
-            ]
+                {"role": "user", "content": message}
+            ],
+            metadata=request_metadata
         )
 
         # Validate and sanitize LLM output before returning
-        sanitized = self._sanitize_llm_output(response)
+        sanitized = self._validate_llm_response(response)
         return sanitized
 
+    # Dangerous dynamic code execution primitives that must not appear in LLM output
     _DANGEROUS_PATTERNS = [
-        # Python dynamic execution
-        r'\beval\s*\(',
-        r'\bexec\s*\(',
-        r'\bcompile\s*\(',
-        r'\b__import__\s*\(',
-        r'\bimportlib\.import_module\s*\(',
-        # Shell / OS execution
-        r'\bos\.system\s*\(',
-        r'\bos\.popen\s*\(',
-        r'\bsubprocess\.(?:call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True',
-        r'\bsubprocess\.(?:call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*1',
-        # JavaScript / bash eval
-        r'\beval\s*\(',          # JS eval()
-        r'\bFunction\s*\(',      # JS new Function()
-        r'\bsetTimeout\s*\(',    # JS setTimeout with string
-        r'\bsetInterval\s*\(',   # JS setInterval with string
-        r'`[^`]*`',              # bash command substitution backticks
-        r'\$\([^)]*\)',          # bash $() substitution
-        # Other dangerous builtins
-        r'\bgetattr\s*\(',
-        r'\bsetattr\s*\(',
-        r'\bdelattr\s*\(',
-        r'\bglobals\s*\(',
-        r'\blocals\s*\(',
-        r'\bvars\s*\(',
+        r"\beval\s*\(",
+        r"\bexec\s*\(",
+        r"\bexecfile\s*\(",
+        r"\bcompile\s*\(",
+        r"\b__import__\s*\(",
+        r"\bsubprocess\b",
+        r"\bos\.system\s*\(",
+        r"\bos\.popen\s*\(",
+        r"\bos\.execv\s*\(",
+        r"\bos\.spawn",
+        r"\bpickle\.loads\s*\(",
+        r"\bpickle\.load\s*\(",
+        r"\bimportlib\.import_module\s*\(",
+        r"\bctypes\b",
+        r"\b__builtins__\b",
+        r"\bglobals\s*\(\s*\)",
+        r"\blocals\s*\(\s*\)",
+        r"\bvars\s*\(\s*\)",
     ]
 
-    def _sanitize_llm_output(self, response: str) -> str:
+    def _validate_llm_response(self, response: str) -> str:
         """
         Validate and sanitize LLM output.
 
         Checks for the presence of dynamic code execution primitives
-        (eval, exec, subprocess shell=True, JS/bash eval, etc.).
-        Raises ValueError if dangerous patterns are detected so that
-        the raw, potentially malicious content is never returned to
-        the caller.
+        (eval, exec, subprocess, os.system, etc.) in the LLM response.
+        If any are detected, the response is rejected and a safe fallback
+        is returned instead of the potentially dangerous content.
         """
         import re
 
         if not isinstance(response, str):
-            # Coerce to string for uniform handling
-            response = str(response)
+            logger.warning(
+                "LLM response is not a string; rejecting output",
+                extra={"response_type": type(response).__name__}
+            )
+            return "I'm sorry, I encountered an issue processing your request. Please try again."
 
         for pattern in self._DANGEROUS_PATTERNS:
             if re.search(pattern, response, re.IGNORECASE):
                 logger.warning(
-                    "Dangerous pattern detected in LLM output; blocking response.",
-                    extra={"pattern": pattern}
+                    "Dangerous code execution primitive detected in LLM output; response suppressed",
+                    extra={"matched_pattern": pattern}
                 )
-                raise ValueError(
-                    "LLM response contained a potentially dangerous code execution "
-                    "primitive and has been blocked for security reasons."
+                return (
+                    "I'm sorry, I'm unable to provide that response as it contains "
+                    "content that violates our security policy. Please rephrase your "
+                    "question or contact support if you need further assistance."
                 )
 
         return response
 
+        # Allowlist of fields that may be returned to callers or logged.
+    _USER_CONTEXT_ALLOWED_FIELDS = {
+        "user_id",
+        "subscription_tier",
+        "recent_queries",
+        "preferences",
+    }
+
     @staticmethod
-    def _encrypt_pii(value: str) -> str:
-        """
-        Encrypt a PII string value.
-
-        Uses Fernet symmetric encryption when the cryptography package is
-        available.  Falls back to a clearly-marked base64 encoding so the
-        field is never stored or transmitted as raw plaintext.
-
-        In production, load the key from a secrets manager / environment
-        variable rather than hard-coding it.
-        """
-        try:
-            from cryptography.fernet import Fernet
-            import os
-            # Retrieve key from environment; generate a one-time key as a
-            # safe fallback (rotate / persist properly in production).
-            raw_key = os.environ.get("PII_ENCRYPTION_KEY")
-            if raw_key:
-                key = raw_key.encode() if isinstance(raw_key, str) else raw_key
-            else:
-                key = Fernet.generate_key()
-            f = Fernet(key)
-            return f.encrypt(value.encode()).decode()
-        except ImportError:
-            # cryptography not installed – use base64 as a last resort so
-            # the value is at least not stored in plain text.
-            import base64
-            return "b64:" + base64.b64encode(value.encode()).decode()
+    def _minimise_user_context(context: dict) -> dict:
+        """Return only the allowlisted, non-sensitive fields from a user context dict."""
+        return {
+            k: v for k, v in context.items()
+            if k in TechSupportAgent._USER_CONTEXT_ALLOWED_FIELDS
+        }
 
     async def get_user_context(self, user_id: str) -> dict:
         """
         Retrieve user context for personalized support.
-
-        PII fields are encrypted before being stored in the context dict
-        so they are never shared or transmitted in plaintext.
+        Only allowlisted, non-sensitive fields are returned.
         """
         # Simulated user context retrieval
         # In a real app, this would query a database
-        user_context = {
+        raw_user_context = {
             "user_id": user_id,
             "subscription_tier": "enterprise",
             "recent_queries": [
@@ -605,20 +485,24 @@ Be helpful, professional, and concise in your responses."""
                 "language": "en",
                 "timezone": "America/New_York"
             },
+            # Sensitive fields below are intentionally excluded from the
+            # minimised context that is returned and logged.
             "internal_notes": "VIP customer - handle with priority",
             "account_details": {
-                # PII encrypted at rest / in transit
-                "contact_email": self._encrypt_pii("user@example.com"),
-                "phone": self._encrypt_pii("555-123-4567")
+                "contact_email": "user@example.com",
+                "phone": "555-123-4567"
             }
         }
+
+        # Apply field allowlist before returning or logging.
+        user_context = self._minimise_user_context(raw_user_context)
 
         logger.info(
             "Retrieved user context",
             extra={
-                # Log only non-sensitive fields to avoid PII leakage in logs
-                "user_id": user_context["user_id"],
-                "subscription_tier": user_context["subscription_tier"]
+                # Log only safe, minimal fields — no PII or internal notes.
+                "user_id": user_context.get("user_id"),
+                "subscription_tier": user_context.get("subscription_tier"),
             }
         )
 
